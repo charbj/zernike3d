@@ -1,7 +1,7 @@
 # Zernike3d for cryo-EM analysis
 Computes the Zernike moments (complex coefficients of the Zernike expansion) and Zernike invariants (rotationally invariant norms) from voxel-based MRC density maps (cryo-EM).
 
-![example](https://github.com/charbj/zernike3d/blob/main/src/resources/reconstruct.PNG)
+![example](https://github.com/charbj/zernike3d/blob/main/reconstruction.gif)
 
 ## Requirements
 #### Hardware
@@ -14,19 +14,19 @@ It prioritises:
 #### Memory
 Computing moments to order n=50 represents an expansion of ~12,051 Zernike polynomials. Zernike3D will minimise this by exploiting redundancy and recurrence. However, this still requires 675 radial and 1326 spherical harmonics. Consequently, memory usage scales poorly with volume size. It is strongly recommended to crop the volume to remove as much unnecessary solvent as possible without cropping the signal of the macromolecule. Alternatively, a soft mask can be applied and the masked subvolume can be decomposed (once again, after cropping this region). 
 
-![memory_usage](https://github.com/charbj/zernike3d/blob/main/src/resources/memory_usage.PNG)
+![memory_usage](https://github.com/charbj/zernike3d/blob/main/memory_usage_Figure_1.png)
 
 #### Resolution
 To further minimise memory requirements, consider whether the full pixel size sampling is necessary (e.g. by binning). A factor of 2, e.g. 200 -> 100 px, requires 90 Gb less memory! Here is an example of resolutions obtained for a 64-pixel volume with 1.4 Å pix<sup>-1</sup>. Currently, this relationship depends on the pixel size and the box size (aiming to remove/resolve this).
 
-![resolution_vs_order](https://github.com/charbj/zernike3d/blob/main/src/resources/resolution.PNG)
+![resolution_vs_order](https://github.com/charbj/zernike3d/blob/main/resolution.png))
 
 ## Dependencies
 - python==3.10
 - numpy
 - numba
 - cupy    
-- mrcfile
+- rcfile
 - joblib
 - scipy
 - tqdm
