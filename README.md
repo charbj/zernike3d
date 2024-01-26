@@ -26,7 +26,7 @@ To further minimise memory requirements, consider whether the full pixel size sa
 - numpy
 - numba
 - cupy    
-- rcfile
+- mrcfile
 - joblib
 - scipy
 - tqdm
