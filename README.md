@@ -59,18 +59,94 @@ python zernike_master.py reconstruct \
 ~~~
 
 #### Decompose a 3DVA job from cryoSPARC in WIGGLE (.wgl/.npz) format into Zernike moments (saved as a .npz file).
-##### In order to handle the 3DVA base volume and component maps, these must be bundled together along with the scaling factors from cryoSPARC. [WIGGLE](https://github.com/charbj/wiggle/tree/main) provides a utility to take the `map.mrc`, `component_0.mrc`, `component_1.mrc`, etc, and `particles.cs` files and output a single `bundled_3dva.npz` file.
+##### In order to handle the 3DVA base volume and component maps, these must be bundled together along with the scaling factors from cryoSPARC. [WIGGLE](https://github.com/charbj/wiggle/tree/main) provides a utility to take the `map.mrc`, `component_0.mrc`, `component_1.mrc`, etc, and `particles.cs` files and output a single `bundled_3dva.npz` file. These files are pretty simple, so you could probably generate the file yourself with a few lines of python:
+~~~pycon
+>>> import numpy as np
+>>> f = np.load('test_3dva.npz', allow_pickle=True)
+>>> f.keys
+<bound method Mapping.keys of NpzFile 'test_3dva.npz' with keys: latents, dim, apix, arr_0, arr_1...>
+>>> f['latents'][0:10]           #The scalar weights of the 3DVA latent space
+array([[  7.4729023 ,   6.832714  , -33.30121   ,   5.044608  ,
+         11.376951  ],
+       [ 19.616875  , -25.294249  , -36.11458   , -18.165325  ,
+         48.48419   ],
+       [-36.886692  ,  14.499297  , -15.675574  , -10.1494    ,
+         50.46876   ],
+       [  9.554419  ,  38.54905   ,   0.38004974, -14.412842  ,
+         -3.0512257 ],
+       [ 31.750261  ,  -3.0132551 ,  16.870565  ,  45.401466  ,
+          6.4584966 ],
+       [ -2.8442464 ,  28.176533  ,  17.966751  , -59.378757  ,
+          7.5261383 ],
+       [ 34.960415  ,  22.40595   , -15.593164  , -41.62918   ,
+         -2.1461964 ],
+       [ 43.29809   ,  32.435684  , -22.64612   ,  -7.7810197 ,
+         -8.789153  ],
+       [ 10.623635  , -49.933887  , -48.178192  ,  33.493988  ,
+         31.926722  ],
+       [-82.7782    ,  -4.7471595 ,  -1.859404  , -23.770464  ,
+        -13.955286  ]], dtype=float32)
+>>> f['apix']
+array(1)
+>>> f['arr_0'][0:10]            #The moments of the first component
+array([-5.5713095e-05+0.0000000e+00j,  1.3842816e-05+0.0000000e+00j,
+       -5.5967530e-06-2.8170200e-05j, -3.6291796e-05+0.0000000e+00j,
+       -3.9011447e-06+0.0000000e+00j, -4.5352658e-06-2.6491825e-06j,
+        2.0415033e-07-2.2599554e-05j, -4.5965538e-05+0.0000000e+00j,
+        3.1379077e-05+1.0098607e-04j, -1.1113875e-06+0.0000000e+00j],
+      dtype=complex64)
+~~~
 
+
+##### Providing a file of this type is handled automatically and the moments are calculated for the base map, and each of the variability components
 ~~~
 python zernike_master.py decomposition \
 --mode spharm --input bundle.npz --order 50 --compute_mode 3 --output test_3dva.npz --gpu_id 0 --verbose
 ~~~
 
 #### Reconstruct a single volume from Zernike moments for a given latent coordinate in the 3DVA space
+##### Providing `--z_ind` will fetch the scale factors stored in the `Moments` class and pre-scale the moments accordingly
 ~~~
 python zernike_master.py reconstruct \
 --mode spharm --moments test.npz --z_ind 3450 --order 50 --compute_mode 3 --output reconstructed.mrc --gpu_id 0 --verbose --dimensions 64
 ~~~
+##### The user can also directly provide the scalar weights by `--scales` as a list e.g. `--scales 0 3 4 1`. These must match the dimensions of the latent space.
+~~~
+python zernike_master.py reconstruct \
+--mode spharm --moments test.npz --scales -34 0 0 0 --order 50 --compute_mode 3 --output reconstructed.mrc --gpu_id 0 --verbose --dimensions 64
+~~~
+##### Providing no `--scales` or `-z_ind` will default to reconstructing the base map and the component maps independently.
+~~~
+python zernike_master.py reconstruct \
+--mode spharm --moments test.npz --order 50 --compute_mode 3 --output reconstructed.mrc --gpu_id 0 --verbose --dimensions 64
+~~~
+
+#### Reducing memory requirements
+
+##### The `Zernike` class can perform decomposition and reconstruction in a lower precision 8-bit mode `--bit8` (with some computational cost incurred) to reduce memory requirements. This is basically a lossly compression of the np.complex64 array to a np.uint8 format. The compression has very little effect on the volume quality.
+~~~
+python zernike_master.py decomposition \
+--mode spharm --input bundle.npz --order 50 --compute_mode 3 --output test_3dva.npz --gpu_id 0 --verbose --bit8
+~~~
+##### The `Zernike` class preallocates memory to the GPU via cupy's default memory management. This often uses larger chunks of memory than strictly necessary. Disable pre-allocation with `--preallocate_memory_off` - this is slower, but will use less memory.
+~~~
+python zernike_master.py decomposition \
+--mode spharm --input bundle.npz --order 50 --compute_mode 3 --output test_3dva.npz --gpu_id 0 --verbose --preallocate_memory_off
+~~~
+##### The `Zernike` class can handle cropping and binning if you provide a UCSF Chimera .cmm file with the center position
+~~~
+python zernike_master.py decomposition \
+--mode spharm --input bundle.npz --order 50 --compute_mode 3 --output test_3dva.npz --gpu_id 0 --verbose --com center.cmm --bin 2
+~~~
+
+~~~bash
+(zernike3d) charles $ head center.cmm 
+<marker_set name="J21_map.mrc center">
+<marker id="1" x="118.09" y="119.05" z="111.43" r="0.7" g="0.7" b="0.7" radius="0.82"/>
+</marker_set>
+~~~
+
+##### Note, while it is possible to run `--bit8` and `--preallocate_memory_off` simultaneously, it might simply be faster to perform the computation on CPU within system RAM instead of on the GPU. You should test these on your system...
 
 #### The `Moments` class has utilities for loading, handling, and viewing these moments.
 ```pycon
