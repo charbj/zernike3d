@@ -34,6 +34,7 @@ class Moments:
         self.invariants = {}
         self.ndmoments = {}
         self.ndinvariants = {}
+        self.scaled_moments = {}
         self.latents = None
 
     def _divide_chunks(self, l, n):
@@ -42,6 +43,16 @@ class Moments:
 
     def _chunk_list(self, seq, size):
         return (list[i::size] for i in range(size))
+
+    def _ndmoment_to_ndarray(self):
+        arr = np.zeros((self.dimensions,self.order+1, self.order+1, self.order+1), dtype=np.complex64)
+        mask = np.zeros((self.order+1, self.order+1, self.order+1), dtype=bool)
+        for dim, moments in self.ndmoments.items():
+            for nlm, mom in moments.items():
+                n,l,m = nlm
+                arr[dim,n,l,m] = mom
+                mask[n,l,m] = True
+        return arr, mask
 
     def add_dimension(self):
         dim = len(self.ndmoments)
@@ -63,6 +74,25 @@ class Moments:
                 self.invariants[nl] = np.linalg.norm(invar)
             self.ndinvariants[dimension] = self.invariants
             self.invariants = {}
+
+    def apply_scaling(self, z_ind=None, scales=None):
+        momentsarray, momentsmask = self._ndmoment_to_ndarray()
+        self.scales = np.hstack([np.ones_like(self.latents[:, :1]), self.latents])
+        if z_ind is None and scales is None:
+            print(f"No latent coordinates were provided `apply_scaling(scales=(3.2,4.5,-0.9,...,3.1,0.2))` and "
+                  f"no Z-index was provided `apply_scaling(z_ind=5537)`, so returning a random latent coordinate.")
+            z_ind = np.random.choice(len(self.latents))
+            print(f"Chose {self.scales[z_ind]}")
+            scaled_moments = np.tensordot(self.scales[z_ind], momentsarray, axes=([-1], [0]))
+        elif z_ind is not None:
+            scaled_moments = np.tensordot(self.scales[z_ind], momentsarray, axes=([-1], [0]))
+        elif scales is not None:
+            scales = np.array([1,*scales]).astype(np.float32)
+            scaled_moments = np.tensordot(scales, momentsarray, axes=([-1], [0]))
+        else:
+            scaled_moments = None
+
+        self.scaled_moments = {(n, l, m): moment for (n, l, m), moment in np.ndenumerate(scaled_moments) if momentsmask[n,l,m]}
 
     def get_moment_size(self):
         if self.ndmoments:
@@ -1948,16 +1978,16 @@ class ZernikeSpherical:
             self.R_nl[mem][(n, l)] = array
 
     def R_nl_recurrence(self, n, l, r, mem):
+        xp = cp if mem == 'vram' else np
+
         if l == n:
             R = r**n
-            self._set_Rnl(n, l, R, mem)
-            # self.R_nl_dict[(n, l)] = R
-            return R.astype(np.float32)
+            self._set_Rnl(n, l, R.astype(xp.float32), mem)
+            return R.astype(xp.float32)
         elif l == (n - 2):
             R = (n + 0.5)*(r**n) - (n - 0.5)*(r**(n-2))
-            self._set_Rnl(n, l, R, mem)
-            # self.R_nl_dict[(n, l)] = R
-            return R.astype(np.float32)
+            self._set_Rnl(n, l, R.astype(xp.float32), mem)
+            return R.astype(xp.float32)
         elif l <= (n - 4):
             k_0 = (n - l) * (n + l + 1) * (2 * n - 3)
             k_1 = (2 * n - 1) * (2 * n + 1) * (2 * n - 3)
@@ -1968,9 +1998,8 @@ class ZernikeSpherical:
             K_3 = k_3 / k_0
 
             R = (K_1*(r**2)+K_2) * self.R_nl[mem][(n - 2, l)] + K_3*self.R_nl[mem][(n - 4, l)]
-            self._set_Rnl(n, l, R, mem)
-            # self.R_nl_dict[(n,l)] = R
-            return R.astype(np.float32)
+            self._set_Rnl(n, l, R.astype(xp.float32), mem)
+            return R.astype(xp.float32)
         else:
             print(f"Error, got invalid n or l")
 
@@ -2252,7 +2281,7 @@ class ZernikeSpherical:
         if self.mode == '3':
             # CALCULATE THE SPHERICAL HARMONICS
             if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m)")
+                print(f"Calculating spherical harmonic functions, Y(l,m), on GPU")
             _theta = cp.asarray(theta)
             _phi = cp.asarray(phi)
             for job in tqdm(sorted(jobs_for_Y), total=len(jobs_for_Y)):
@@ -2277,22 +2306,21 @@ class ZernikeSpherical:
                 self._set_Ylm(l, m, Y, 'vram')
                 del self.P_lm['vram'][keys]
                 if (count%1000 == 0):
-                    cp._default_memory_pool.free_all_blocks()
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
 
             # CALCULATE THE RADIAL COMPONENT
             if self.args.verbose:
-                print(f"Calculating radial functions, R(n,l), on CPU (ray parallel)")
-            # _r = ray.put(r)
-            # obj_ids = [self._calculate_R.remote(job, _r) for job in jobs_for_R]
-            # for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
-            #     n, l, R = x
-            #     R = cp.asarray(R)
-            #     self._set_Rnl(n, l, R, 'vram')
+                print(f"Calculating radial functions, R(n,l), on GPU")
             _r = cp.asarray(r)
             for job in tqdm(sorted(jobs_for_R), total=len(jobs_for_R)):
                 n, l = job
                 R = cp.nan_to_num(self.R_nl_recurrence(n, l, _r, 'vram'))
                 self._set_Rnl(n, l, R, 'vram')
+
+            del _r, _theta, _phi
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
 
         elif self.mode == '3m':
             mem = self.budgetGPU - R_size_p
@@ -2459,7 +2487,6 @@ class ZernikeSpherical:
             with open('Y_lm_dict.pkl', 'wb') as f:
                 pickle.dump(Y_lm_dict, f)
 
-
         return _jobs_for_M
 
     def Decompose(self, volume, dim, jobs):
@@ -2612,22 +2639,22 @@ class ZernikeSpherical:
             grid += np.nan_to_num(np.conj(mom) * np.multiply(R,np.conj(Y)))
         return grid
 
-    def Reconstruct(self, moments, jobs):
+    def Reconstruct(self, jobs, apply_latent_scaling=False):
         # Check for minimum number of moments or user defined limit
         # order = min(self.moments,self.order) # to do
-        num_latent_dims = self.moments.load(moments)
-        if num_latent_dims == 0:
-            num_latent_dims += 1
+        # self.moments.load(moments)
+
+        _rec_jobs = range(1) if apply_latent_scaling else range(self.moments.dimensions)
         _jobs_for_M = jobs
         order = self.args.order
-        for _rec in range(num_latent_dims):
+        for _rec in _rec_jobs:
+            print(f"Summing the Zernike components up to order, n: {order}")
             if self.mode == 2:
                 Y_lm_memory_map = ray.put(self.Y_lm_memory_map)
                 Y_lm = ray.put(self.Y_lm)
                 R_nl_memory_map = ray.put(self.R_nl_memory_map)
                 R_nl = ray.put(self.R_nl)
                 out = 0
-                print(f"Summing the Zernike components up to order, n: {order}")
                 for n in tqdm(range(self.order+1)):
                     _component_jobs = []
                     for l in range(n + 1):
@@ -2645,25 +2672,28 @@ class ZernikeSpherical:
                         cumulative.append(out)
 
                     if n % 5 == 0:
-                        with mrcfile.open(''.join(['intermediate_component_', str(n).zfill(3), '.mrc']), mode='w+') as mrc_out:
-                            mrc_out.set_data(np.array(np.real(out*mask), np.float32))
-                            mrc_out.voxel_size = apix
+                        name = ''.join(['intermediate_vol_component_', str(_rec), 'n_', str(n).zfill(3), '.mrc'])
+                        self.write_mrc_file(volume=np.array(np.real(out*mask), np.float32), name=name)
 
-                name = str(self.args.output) + str(_rec)
-                with mrcfile.open(name, mode='w+') as mrc:
-                    mrc.set_data(np.array(np.real(out), np.float32))
-                    mrc.voxel_size = 1 if self.apix is None else self.apix
+                if apply_latent_scaling:
+                    name = str(self.args.output).split('.')[0] + '_scaled.mrc'
+                else:
+                    name = str(self.args.output).split('.')[0] + '_' + str(_rec) + '.mrc'
+                self.write_mrc_file(volume=np.array(np.real(out), np.float32), name=name)
                 ray.shutdown()
                 return cumulative
+
             else:
-                print(f"Summing the Zernike components up to order, n: {order}")
                 cumulative = 0 + 1j
                 for n in tqdm(range(order + 1)):
                     _component_jobs = []
                     for l in range(n + 1):
                         if (n - l) % 2 == 0:
                             for m in range(l + 1):
-                                mom = self.moments.get_moment(n, l, m, latent_dim=_rec)
+                                if apply_latent_scaling:
+                                    mom = self.moments.scaled_moments[n,l,m]
+                                else:
+                                    mom = self.moments.get_moment(n, l, m, latent_dim=_rec)
                                 _component_jobs.append((n, l, m, mom))
 
                     #GPU Parallel
@@ -2671,17 +2701,24 @@ class ZernikeSpherical:
                     cumulative += component
 
                     if (n % 5 == 0) and self.args.verbose:
-                        with mrcfile.open(''.join(['intermediate_component_', str(n).zfill(3), '.mrc']),
-                                          mode='w+') as mrc_out:
-                            data = cp.asnumpy(cp.real(cumulative))
-                            mrc_out.set_data(np.array(data, np.float32))
-                            mrc_out.voxel_size = 1 if self.args.apix is None else self.args.apix
+                        name = ''.join(['intermediate_vol_component_', str(_rec), 'n_', str(n).zfill(3), '.mrc'])
+                        self.write_mrc_file(volume=cp.asnumpy(cp.real(cumulative)), name=name)
 
-                name = str(self.args.output).split('.')[0] + '_' + str(_rec) + '.mrc'
-                with mrcfile.open(name, mode='w+') as mrc:
-                    data = cp.asnumpy(cp.real(cumulative))
-                    mrc.set_data(np.array(data, np.float32))
-                    mrc.voxel_size = 1 if self.args.apix is None else self.args.apix
+                if apply_latent_scaling:
+                    if self.args.z_ind:
+                        name = f"{str(self.args.output).split('.')[0]}_scaled_{self.args.z_ind}.mrc"
+                    elif self.args.scales:
+                        _s = '_'.join([s for s in self.args.scales])
+                        name = f"{str(self.args.output).split('.')[0]}_scaled_{_s}.mrc"
+                else:
+                    name = str(self.args.output).split('.')[0] + '_' + str(_rec) + '.mrc'
+                self.write_mrc_file(volume=cp.asnumpy(cp.real(cumulative)), name=name)
+
+    def write_mrc_file(self, volume, name):
+        with mrcfile.open(name, mode='w+') as mrc_out:
+            data = volume
+            mrc_out.set_data(np.array(data, np.float32))
+            mrc_out.voxel_size = 1 if self.args.apix is None else self.args.apix
 
     def crop_array(self, array, crop):
         def crop_it(_array, _crop):
@@ -2770,12 +2807,12 @@ class ZernikeSpherical:
             if bin is None:
                 return [crop_it(vol, crop, center) for vol in array]
             else:
-                return [crop_it(bin_it(vol, 1/bin), crop, tuple(int(ti/bin) for ti in center)) for vol in array]
+                return [bin_it(crop_it(vol, crop, center), 1/bin) for vol in array]
         else:
             if bin is None:
                 return crop_it(array, crop, center)
             else:
-                return crop_it(bin_it(array, 1/bin), crop, tuple(int(ti/bin) for ti in center))
+                return bin_it(crop_it(array, crop, center), 1/bin) #crop_it(bin_it(array, 1/bin), crop, tuple(int(ti/bin) for ti in center))
 
     def parse_marker_set(self, xml_string):
         # find the start and end indices of the x, y, and z attributes
@@ -2841,6 +2878,7 @@ class ZernikeSpherical:
             self.dim = volume.shape[0] if single else volume[0].shape[0]
             print(f'Detected dimensions: {self.dim}')
             jobs = self.CalculatePolynomials()
+
             if single:
                 self.Decompose(volume, self.dim, jobs)
                 self.moments.save(output=self.args.output, compress=self.args.save_bit8, dim=self.dim, apix=self.apix)
@@ -2862,7 +2900,19 @@ class ZernikeSpherical:
             self.dim = self.args.dimensions if not None else np.load(self.args.moments)['dim']
             print(f'Detected dimensions: {self.dim}')
             jobs = self.CalculatePolynomials()
-            self.Reconstruct(self.args.moments, jobs)
+
+            self.moments.load(self.args.moments)
+            if self.args.z_ind:
+                print(f"Got z_ind {self.args.z_ind}, scaling moments and reconstructing.")
+                self.moments.apply_scaling(z_ind=self.args.z_ind)
+                self.Reconstruct(jobs, apply_latent_scaling=True)
+            elif self.args.scales:
+                print(f"Got scales {self.args.scales}, scaling moments and reconstructing.")
+                self.moments.apply_scaling(scales=self.args.scales)
+                self.Reconstruct(jobs, apply_latent_scaling=True)
+            else:
+                print(f"No scales or z_ind, will reconstruct base volume and component maps.")
+                self.Reconstruct(jobs)
 
 if __name__ == "__main__":
     class bcolors:
@@ -3035,6 +3085,11 @@ if __name__ == "__main__":
         help="Make verbose.",
         action='store_true'
     )
+    parser_agent.add_argument(
+        "--preallocate_memory_off",
+        action='store_true',
+        help="Preallocate GPU memory is much faster. Turn off pre-allocation using --preallocate_memory_off to use less memory in case of out-of-memory errors (slower).",
+    )
 
     # create the parse for the "RECONSTRUCT" sub-command
     parser_learner = sub_parsers.add_parser("reconstruct", help="Reconstruct the object from Zernike moments")
@@ -3067,6 +3122,18 @@ if __name__ == "__main__":
         "--dimensions",
         type=int,
         help="Reconstruction box size.",
+        default=None
+    )
+    parser_learner.add_argument(
+        "--z_ind",
+        type=int,
+        help="Index of the scaling latent coodinates to use.",
+        default=None
+    )
+    parser_learner.add_argument(
+        "--scales",
+        nargs='+',
+        help="List of scaling factors e.g. 4.5 78 2 ... Must match the dimensions of the space!",
         default=None
     )
     parser_learner.add_argument(
@@ -3117,8 +3184,17 @@ if __name__ == "__main__":
         action='store_true',
         help="Make verbose.",
     )
+    parser_learner.add_argument(
+        "--preallocate_memory_off",
+        action='store_true',
+        help="Preallocate GPU memory is much faster. Turn off pre-allocation using --preallocate_memory_off to use less memory in case of out-of-memory errors (slower).",
+    )
 
     args = my_parser.parse_args()
+    if args.preallocate_memory_off:
+        cp.cuda.set_allocator(None)
+        cp.cuda.set_pinned_memory_allocator(None)
+
     if args.operating_mode == 'decomposition':
         if args.com and (args.crop_to is None):
             my_parser.error(
