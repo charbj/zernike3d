@@ -434,8 +434,16 @@ class ComplexArray:
         max_args = float(xp.amax(args))
         dr = max_args/256
         if dr == 0:
-            print('got zero')
-            return (xp.zeros(complex_array.shape, dtype=np.uint8), xp.zeros_like(complex_array, dtype=np.uint8), 0, 0)
+            _args = xp.zeros(complex_array.shape, dtype=np.uint8)
+            _phases = xp.zeros_like(complex_array, dtype=np.uint8)
+            dtheta = 0  # no angular resolution if args are zero
+
+            if in_gpu and not out_gpu:
+                return (cp.asnumpy(_args), cp.asnumpy(_phases), 0, dtheta)
+            elif not in_gpu and out_gpu:
+                return (cp.asarray(_args), cp.asarray(_phases), 0, dtheta)
+            else:
+                return (_args, _phases, 0, dtheta)
 
         rbins = xp.arange(0, max_args, dr)
         _args = xp.digitize(args, rbins, right=False).astype(np.uint8)
@@ -3213,4 +3221,5 @@ if __name__ == "__main__":
             Z = ZernikeSpherical(args)
         else:
             Z = ZernikeMonomial(args)
+
         Z.run(reconstruct=True)
