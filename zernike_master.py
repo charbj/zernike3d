@@ -60,9 +60,24 @@ class Moments:
         self.moments = {}
 
     def calculate_invariants(self):
-        for dimension, moments in self.ndmoments.items():
+        if self.ndmoments:
+            for dimension, moments in self.ndmoments.items():
+                partial = {}
+                for nlm, mom in moments.items():
+                    n, l, m = nlm
+                    if m == 0:
+                        partial.setdefault((n, l), []).append(np.abs(mom))
+                    else:
+                        partial.setdefault((n, l), []).append(np.abs(mom))
+                        partial.setdefault((n, l), []).append(np.abs(mom))
+
+                for nl, invar in partial.items():
+                    self.invariants[nl] = np.linalg.norm(invar)
+                self.ndinvariants[dimension] = self.invariants
+                self.invariants = {}
+        else:
             partial = {}
-            for nlm, mom in moments.items():
+            for nlm, mom in self.moments.items():
                 n, l, m = nlm
                 if m == 0:
                     partial.setdefault((n, l), []).append(np.abs(mom))
@@ -72,8 +87,6 @@ class Moments:
 
             for nl, invar in partial.items():
                 self.invariants[nl] = np.linalg.norm(invar)
-            self.ndinvariants[dimension] = self.invariants
-            self.invariants = {}
 
     def apply_scaling(self, z_ind=None, scales=None):
         momentsarray, momentsmask = self._ndmoment_to_ndarray()
@@ -432,8 +445,8 @@ class ComplexArray:
         xp = cp if in_gpu else np
         args, phases = self._rect2polar(complex_array, in_gpu)
         max_args = float(xp.amax(args))
-        dr = max_args/256
-        if dr == 0:
+        dr = max_args/255
+        if dr == 0.0:
             _args = xp.zeros(complex_array.shape, dtype=np.uint8)
             _phases = xp.zeros_like(complex_array, dtype=np.uint8)
             dtheta = 0  # no angular resolution if args are zero
@@ -446,13 +459,14 @@ class ComplexArray:
                 return (_args, _phases, 0, dtheta)
 
         rbins = xp.arange(0, max_args, dr)
-        _args = xp.digitize(args, rbins, right=False).astype(np.uint8)
+        _args = xp.digitize(args, rbins, right=True).astype(np.uint8)
 
         dtheta = 2*np.pi/256
-        tbins = xp.arange(-np.pi, np.pi, dtheta)
-        _phases = xp.digitize(phases, tbins, right=False).astype(np.uint8)
+        phases_norm = phases % (2 * np.pi)
+        _phases = (phases_norm / (2*np.pi) * 256).astype(np.uint8)
+        _phases[_phases == 256] = 0
 
-        del args, phases, tbins, rbins
+        del args, phases, rbins
         if in_gpu and not out_gpu:
             return (cp.asnumpy(_args), cp.asnumpy(_phases), dr, dtheta)
         elif not in_gpu and out_gpu:
@@ -1860,7 +1874,8 @@ class ZernikeSpherical:
         self.R_nl_memory_map = {}
 
         num_cpus = 16 if self.args.cpu_tasks is None else self.args.cpu_tasks
-        ray.init(num_cpus=num_cpus)
+        if self.args.compute_mode != '3':
+            ray.init(num_cpus=num_cpus)
 
         print("Created `Zernike` instance")
 
@@ -2151,6 +2166,69 @@ class ZernikeSpherical:
         _arr = np.nan_to_num((r**l) * scipy.special.jacobi(int(n-l)/2, 0, l + 0.5)(2*(r**2)-1)).astype(np.float32)
         return n, l, _arr
 
+    def check_array_backends(self, jobs, volume):
+        """
+        Check whether arrays returned by _get_Rnl and _get_Ylm are NumPy or CuPy.
+        Will print summary and flag any mixed types.
+        """
+        import numpy as np
+        import cupy as cp
+
+        backend_counts = {"numpy": 0, "cupy": 0}
+        mixed_found = False
+
+        for idx, job in enumerate(jobs):
+            n, l, m = job
+            R = self._get_Rnl(n, l)
+            Y = self._get_Ylm(l, m)
+
+            # classify R
+            if isinstance(R, np.ndarray):
+                backend_counts["numpy"] += 1
+                R_backend = "numpy"
+            elif isinstance(R, cp.ndarray):
+                backend_counts["cupy"] += 1
+                R_backend = "cupy"
+            else:
+                R_backend = str(type(R))
+
+            # classify Y (note: _get_Ylm returns single array or tuple?)
+            if isinstance(Y, (tuple, list)):
+                Y0, Y1, Y2, Y3 = Y
+                Y_backends = []
+                for y in [Y0, Y1]:
+                    if isinstance(y, np.ndarray):
+                        backend_counts["numpy"] += 1
+                        Y_backends.append("numpy")
+                    elif isinstance(y, cp.ndarray):
+                        backend_counts["cupy"] += 1
+                        Y_backends.append("cupy")
+                    else:
+                        Y_backends.append(str(type(y)))
+            else:
+                if isinstance(Y, np.ndarray):
+                    backend_counts["numpy"] += 1
+                    Y_backends = ["numpy"]
+                elif isinstance(Y, cp.ndarray):
+                    backend_counts["cupy"] += 1
+                    Y_backends = ["cupy"]
+                else:
+                    Y_backends = [str(type(Y))]
+
+            # Print diagnostics
+            print(f"[Job {idx}] (n={n}, l={l}, m={m}) "
+                  f"R={R_backend}, Y={Y_backends}")
+
+            # Check for mixing in this job
+            if len(set([R_backend] + Y_backends)) > 1:
+                mixed_found = True
+                print(f"  >>> MIXED TYPES DETECTED in job {job} <<<")
+
+        print("\n=== SUMMARY ===")
+        print(f"NumPy arrays: {backend_counts['numpy']}")
+        print(f"CuPy arrays: {backend_counts['cupy']}")
+        print("Mixed detected:", mixed_found)
+
     def _calculate_Z_CPU(self, job, volume):
         n, l, m = job
         coeff = (2 * (2 * n + 3)) / (3 * np.sqrt(3) * np.pi * (self.dim ** 3))
@@ -2171,7 +2249,7 @@ class ZernikeSpherical:
 
     @staticmethod
     @ray.remote
-    def _calculate_Z_CPU_multi(job, vol, dim, Y_lm_memory_map, Y_lm_zarr, Y_lm, R_nl_memory_map, R_nl_zarr, R_nl):
+    def _calculate_Z_CPU_multi(job, vol, dim, Y_lm_memory_map, Y_lm_zarr, Y_lm, R_nl_memory_map, R_nl_zarr, R_nl, C, bit8=False):
         def _get_Ylm(l, m):
             loc = Y_lm_memory_map[(l, m)]
             if loc == 'zarr':
@@ -2190,6 +2268,10 @@ class ZernikeSpherical:
         coeff = (2 * (2 * n + 3)) / (3 * np.sqrt(3) * np.pi * (dim ** 3))
         R = _get_Rnl(n, l)
         Y = _get_Ylm(l, m)
+
+        if bit8:
+            Y = C.read_as_complex64(Y, in_gpu=False, out_gpu=False)
+
         Z = R*Y.conj()
 
         inner_product = np.tensordot(vol, Z, axes=3)
@@ -2255,27 +2337,28 @@ class ZernikeSpherical:
         Y_size_p = mu_Y(order) * (self.dim ** 3) * 8 * quantize_factor * parity_factor
         R_size_p = mu_R(order) * (self.dim ** 3) * 4
         if self.args.verbose:
-            print(f"Predicted size of Y(l, m) array : {(Y_size_p/1e9):.3f} Gb")
-            print(f"Predicted size of R(n, l) array : {(R_size_p/1e9):.3f} Gb")
+            print(f"Predicted size of Y(l, m) array : {(Y_size_p/1e9):.3f} Gb, {mu_Y(order)} volumes.")
+            print(f"Predicted size of R(n, l) array : {(R_size_p/1e9):.3f} Gb, {mu_R(order)} volumes.")
+            print(f"Total required memory {(Y_size_p/1e9 + R_size_p/1e9):.3f} Gb.")
 
         # Check system resources
         self._check_resources_mode(Y_size_p, R_size_p)
 
-        #Initialise zarr in case of mode `1m` or `0`
-        if self.mode in ['1m', '0']:
+        #Initialise zarr in case of mode `0`
+        if self.mode in ['0']:
             data_type = np.complex64 if self.args.bit8 is None else self.args.bit8
             compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
             self.Y_lm_zarr = zarr.open('Y_lm.zarr',
                                   mode='a',
-                                  shape=(order+1,order+1,*volume.shape),
-                                  chunks=(1,1,*volume.shape),
+                                  shape=(order+1,order+1,*self.dim.shape),
+                                  chunks=(1,1,*self.dim.shape),
                                   dtype=np.complex64,
                                   compressor=compressor)
 
             self.R_nl_zarr = zarr.open('R_nl.zarr',
                                   mode='a',
-                                  shape=(order+1,order+1,*volume.shape),
-                                  chunks=(1,1,*volume.shape),
+                                  shape=(order+1,order+1,*self.dim.shape),
+                                  chunks=(1,1,*self.dim.shape),
                                   dtype=np.float32,
                                   compressor=compressor)
 
@@ -2286,21 +2369,24 @@ class ZernikeSpherical:
         jobs_for_R, jobs_for_Y, _jobs_for_M = self._get_jobs(order)
 
         # BEGIN EXECUTION OF JOBS
+        # ONLY USES RECURRENCE
         if self.mode == '3':
             # CALCULATE THE SPHERICAL HARMONICS
             if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m), on GPU")
+                print(f"Spherical harmonics, Y(l,m) || GPU || recurrence")
             _theta = cp.asarray(theta)
             _phi = cp.asarray(phi)
             for job in tqdm(sorted(jobs_for_Y), total=len(jobs_for_Y)):
                 l, m = job
-                # _arr = cp_sph_harm(m, l, _phi, _theta)
                 Plm = self.Y_lm_recurrence(l, m, _theta, _phi, 'vram').astype(np.float32)
                 self.P_lm['vram'][(l, m)] = Plm
 
             if self.args.verbose:
                 print(f"Compressing, and memory clean up")
             for count,keys in tqdm(enumerate(list(self.P_lm['vram'].keys())), total=len(self.P_lm['vram'])):
+                if (count%50 == 0):
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
                 l, m = keys
                 _arr = self.P_lm['vram'][keys] * cp.exp(1j * m * _phi)
                 Y = cp.nan_to_num(_arr).astype(np.complex64)
@@ -2313,13 +2399,12 @@ class ZernikeSpherical:
 
                 self._set_Ylm(l, m, Y, 'vram')
                 del self.P_lm['vram'][keys]
-                if (count%1000 == 0):
-                    cp.get_default_memory_pool().free_all_blocks()
-                    cp.get_default_pinned_memory_pool().free_all_blocks()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
 
             # CALCULATE THE RADIAL COMPONENT
             if self.args.verbose:
-                print(f"Calculating radial functions, R(n,l), on GPU")
+                print(f"Radial components, R(n,l) || GPU || recurrence")
             _r = cp.asarray(r)
             for job in tqdm(sorted(jobs_for_R), total=len(jobs_for_R)):
                 n, l = job
@@ -2330,83 +2415,105 @@ class ZernikeSpherical:
             cp.get_default_memory_pool().free_all_blocks()
             cp.get_default_pinned_memory_pool().free_all_blocks()
 
-        elif self.mode == '3m':
-            mem = self.budgetGPU - R_size_p
-            mem_chunk = (self.dim ** 3) * 2 * m_factor
-            if self.args.verbose:
-                print(f'GPU memory budget set to: {mem / 1E9} Gb. Each component uses: {mem_chunk / 1E9} Gb.')
-            Y_jobs_on_GPU = []
-            Y_jobs_on_CPU = []
-            for job in sorted(jobs_for_Y):
-                if mem > 0:
-                    Y_jobs_on_GPU.append(job)
-                else:
-                    Y_jobs_on_CPU.append(job)
-                mem -= mem_chunk
-
-            # CALCULATE THE RADIAL COMPONENT
-            if self.args.verbose:
-                print(f"Calculating radial functions, R(n,l), on CPU (ray parallel)")
-            _r = ray.put(r)
-            obj_ids = [self._calculate_R.remote(job, _r) for job in jobs_for_R]
-            for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
-                n, l, R = x
-                R = cp.asarray(R)
-                self._set_Rnl(n, l, R, 'vram')
-
+        # ONLY USES RECURRENCE
+        elif self.mode == '2':
             # CALCULATE THE SPHERICAL HARMONICS
             if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m) | CPU batch")
+                print(f"Spherical harmonics, Y(l,m) || GPU (then pass to CPU) || recurrence")
             _theta = cp.asarray(theta)
             _phi = cp.asarray(phi)
-
-            # CALCULATE THE EXCESS ON GPU THEN PASS TO CPU
-            for job in tqdm(Y_jobs_on_CPU, total=len(Y_jobs_on_CPU)):
+            for job in tqdm(sorted(jobs_for_Y), total=len(jobs_for_Y)):
                 l, m = job
-                if self.args.bit8:
-                    Y = cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64)
-                    Y = self.C.reduce_to_8bit(Y, in_gpu=True, out_gpu=False)
-                else:
-                    Y = cp.asnumpy(cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64))
-                self._set_Ylm(l, m, Y, 'ram')
+                Plm = self.Y_lm_recurrence(l, m, _theta, _phi, 'vram').astype(np.float32)
+                self.P_lm['vram'][(l, m)] = Plm
 
             if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m) | GPU batch")
-            #STORE THE REMAINDER IN GPU RAM
-            for job in tqdm(Y_jobs_on_GPU, total=len(Y_jobs_on_GPU)):
-                l, m = job
-                if self.args.bit8:
-                    Y = cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64)
-                    Y = self.C.reduce_to_8bit(Y, in_gpu=True, out_gpu=True)
-                else:
-                    Y = cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64)
-                self._set_Ylm(l, m, Y, 'vram')
+                print(f"Compressing, and memory clean up")
+            for count,keys in tqdm(enumerate(list(self.P_lm['vram'].keys())), total=len(self.P_lm['vram'])):
+                if (count%50 == 0):
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                l, m = keys
+                _arr = self.P_lm['vram'][keys] * cp.exp(1j * m * _phi)
+                Y = cp.nan_to_num(_arr).astype(np.complex64)
 
-        elif self.mode == '2':
+                if self.args.parity:
+                    Y = self._parity_Ylm(Y, m, gpu=True)
+
+                if self.args.bit8:
+                    Y = self.C.reduce_to_8bit(Y, in_gpu=True, out_gpu=False)
+                    self._set_Ylm(l, m, Y, 'ram')
+                else:
+                    self._set_Ylm(l, m, cp.asnumpy(Y), 'ram')
+
+                del self.P_lm['vram'][keys]
+
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+
             # CALCULATE THE RADIAL COMPONENT
             if self.args.verbose:
-                print(f"Calculating radial functions, R(n,l), on CPU (ray parallel)")
-            _r = ray.put(r)
-            obj_ids = [self._calculate_R.remote(job, _r) for job in jobs_for_R]
-            for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
-                n, l, R = x
+                print(f"Radial components, R(n,l) || GPU (then pass to CPU) || recurrence")
+            _r = cp.asarray(r)
+            for job in tqdm(sorted(jobs_for_R), total=len(jobs_for_R)):
+                n, l = job
+                R = cp.nan_to_num(self.R_nl_recurrence(n, l, _r, 'vram'))
+                self._set_Rnl(n, l, R, 'vram')
+
+            # --- Move all R_nl arrays back to CPU memory ---
+            if self.args.verbose:
+                print("Transferring R_nl arrays from GPU to CPU...")
+
+            for count,(n, l) in tqdm(enumerate(list(self.R_nl['vram'].keys())), total=len(self.R_nl['vram'])):
+                if (count%50 == 0):
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                R = self.R_nl['vram'][(n, l)]
+                if isinstance(R, cp.ndarray):
+                    self._set_Rnl(n, l, cp.asnumpy(R), 'ram')
+                    del self.R_nl['vram'][(n, l)]
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+
+            if self.args.verbose:
+                print("All R_nl arrays are now in CPU memory.")
+
+        # ONLY USES RECURRENCE
+        elif self.mode == '1':
+            # CALCULATE THE RADIAL COMPONENT
+            if self.args.verbose:
+                print(f"Radial components, R(n,l) || CPU || recurrence")
+            for job in tqdm(sorted(jobs_for_R), total=len(jobs_for_R)):
+                n, l = job
+                R = np.nan_to_num(self.R_nl_recurrence(n, l, r, 'ram'))
                 self._set_Rnl(n, l, R, 'ram')
 
             # CALCULATE THE SPHERICAL HARMONICS
             if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m)")
-            _theta = cp.asarray(theta)
-            _phi = cp.asarray(phi)
-            for job in tqdm(jobs_for_Y, total=len(jobs_for_Y)):
+                print(f"Spherical harmonics, Y(l,m) || CPU || recurrence")
+            for job in tqdm(sorted(jobs_for_Y), total=len(jobs_for_Y)):
                 l, m = job
-                if self.args.bit8:
-                    Y = cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64)
-                    Y = self.C.reduce_to_8bit(Y, in_gpu=True, out_gpu=False)
-                else:
-                    Y = cp.asnumpy(cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64))
-                self._set_Ylm(l, m, Y, 'ram')
+                Plm = self.Y_lm_recurrence(l, m, theta, phi, 'ram').astype(np.float32)
+                self.P_lm['ram'][(l, m)] = Plm
 
-        elif self.mode == '1':
+            if self.args.verbose:
+                print(f"Compressing, and memory clean up")
+            for count, keys in tqdm(enumerate(list(self.P_lm['ram'].keys())), total=len(self.P_lm['ram'])):
+                l, m = keys
+                _arr = self.P_lm['ram'][keys] * np.exp(1j * m * phi)
+                Y = np.nan_to_num(_arr).astype(np.complex64)
+
+                if self.args.parity:
+                    Y = self._parity_Ylm(Y, m, gpu=False)
+
+                if self.args.bit8:
+                    Y = self.C.reduce_to_8bit(Y, in_gpu=False, out_gpu=False)
+
+                self._set_Ylm(l, m, Y, 'ram')
+                del self.P_lm['ram'][keys]
+
+        # ONLY USES SCIPY (CPU)
+        elif self.mode == '1m':
             # CALCULATE THE RADIAL COMPONENT
             if self.args.verbose:
                 print(f"Calculating radial functions, R(n,l), on CPU (ray parallel)")
@@ -2425,46 +2532,6 @@ class ZernikeSpherical:
             for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
                 l, m, Y = x
                 self._set_Ylm(l, m, Y, 'ram')
-
-        elif self.mode == '1m':
-            mem = self.budgetCPU - R_size_p
-            mem_chunk = (self.dim ** 3) * 2 * m_factor
-            if self.args.verbose:
-                print(f'CPU memory budget set to: {mem/1E9} Gb. Each component uses: {mem_chunk/1E9} Gb.')
-            Y_jobs_on_CPU = []
-            Y_jobs_on_zarr = []
-            for job in sorted(jobs_for_Y):
-                if mem > 0:
-                    Y_jobs_on_CPU.append(job)
-                else:
-                    Y_jobs_on_zarr.append(job)
-                mem -= mem_chunk
-
-            # CALCULATE THE RADIAL COMPONENT
-            if self.args.verbose:
-                print(f"Calculating radial functions, R(n,l), on CPU (ray parallel)")
-            _r = ray.put(r)
-            obj_ids = [self._calculate_R.remote(job, _r) for job in jobs_for_R]
-            for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
-                n, l, R = x
-                self._set_Rnl(n, l, R, 'ram')
-
-            # CALCULATE THE SPHERICAL HARMONICS
-            if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m) | CPU batch")
-            _phi = ray.put(phi)
-            _theta = ray.put(theta)
-            obj_ids = [self._calculate_Y_np.remote(job, _phi, _theta) for job in Y_jobs_on_CPU]
-            for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
-                l, m, Y = x
-                self._set_Ylm(l, m, Y, 'ram')
-
-            if self.args.verbose:
-                print(f"Calculating spherical harmonic functions, Y(l,m) | zarr batch")
-            obj_ids = [self._calculate_Y_np.remote(job, _theta, _phi) for job in Y_jobs_on_zarr]
-            for x in tqdm(self.to_iterator(obj_ids), total=len(obj_ids)):
-                l, m, Y = x
-                self._set_Ylm(l, m, Y, 'zarr')
 
         elif self.mode == '0':
             if self.args.verbose:
@@ -2489,6 +2556,31 @@ class ZernikeSpherical:
                 print(self.Y_lm_zarr.info)
                 print(self.R_nl_zarr.info)
 
+        # ONLY USES SCIPY (GPU/CPU)
+        elif self.mode == 'scipy':
+            # CALCULATE THE RADIAL COMPONENT
+            if self.args.verbose:
+                print(f"Radial components, R(n,l) || CPU || scipy.special.jacobi")
+            _r = ray.put(r)
+            obj_ids = [self._calculate_R.remote(job, _r) for job in jobs_for_R]
+            for i, x in enumerate(tqdm(self.to_iterator(obj_ids), total=len(obj_ids))):
+                n, l, R = x
+                self._set_Rnl(n, l, cp.asarray(R), 'vram')
+
+            # CALCULATE THE SPHERICAL HARMONICS
+            if self.args.verbose:
+                print(f"Spherical harmonics, Y(l,m) || GPU || CUPY sph_harm function")
+            _theta = cp.asarray(theta)
+            _phi = cp.asarray(phi)
+            for job in tqdm(jobs_for_Y, total=len(jobs_for_Y)):
+                l, m = job
+                if self.args.bit8:
+                    Y = cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64)
+                    Y = self.C.reduce_to_8bit(Y, in_gpu=True, out_gpu=True)
+                else:
+                    Y = cp.nan_to_num(cp_sph_harm(m, l, _phi, _theta)).astype(cp.complex64)
+                self._set_Ylm(l, m, Y, 'vram')
+
         if self.args.save:
             with open('R_nl_dict.pkl', 'wb') as f:
                 pickle.dump(R_nl_dict, f)
@@ -2501,7 +2593,10 @@ class ZernikeSpherical:
         _jobs_for_M = jobs
 
         # BEGIN EXECUTION OF JOBS
-        if self.mode == '3':
+        # COMPUTE MODE 3
+        # || GPU ONLY || Very high GPU VRAM requirement
+        # Ylm, Rnl, Z cumulative sum all on GPU (extreme speed)
+        if self.mode in ['3','scipy']:
             _volume = cp.asarray(volume)
 
             if self.args.verbose:
@@ -2511,21 +2606,16 @@ class ZernikeSpherical:
                 n, l, m, mom = moment
                 self.moments.set_moment(n, l, m, mom)
 
-        elif self.mode == '3m':
-            _volume = cp.asarray(volume)
-
-            if self.args.verbose:
-                print(f"Calculating the Zernike moments, Z_nlm")
-            moms = self._calculate_Z_GPU(_jobs_for_M, _volume)
-            for moment in moms:
-                n, l, m, mom = moment
-                self.moments.set_moment(n, l, m, mom)
-
+        # COMPUTE MODE 2
+        # || GPU/CPU MIXED || High system RAM requirement
+        # Ylm & Rnl computed on GPU independently, then passed to CPU for Z cumulative sum (very fast)
         elif self.mode == '2':
             if self.args.verbose:
                 print(f"Calculating the Zernike moments, Z_nlm")
+                #self.check_array_backends(_jobs_for_M, volume)
+                #sys.exit()
 
-            random.shuffle(_jobs_for_M)
+            #random.shuffle(_jobs_for_M)
             for job in tqdm(_jobs_for_M, total=len(_jobs_for_M)):
                 x = self._calculate_Z_CPU(job, volume)
                 if len(x) > 1:
@@ -2536,17 +2626,25 @@ class ZernikeSpherical:
                     n, l, m, mom = x[0]
                     self.moments.set_moment(n, l, m, mom)
 
-        elif self.mode == '1':
-
+        # COMPUTE MODE 1
+        # || CPU ONLY || High system RAM requirement, no GPU needed
+        # Ylm, Rnl, Z cumulative sum all CPU, heavy RAM dependency (fast)
+        elif self.mode in ['1','1m']:
             _vol = ray.put(volume)
             Y_lm_memory_map = ray.put(self.Y_lm_memory_map)
             Y_lm = ray.put(self.Y_lm)
             R_nl_memory_map = ray.put(self.R_nl_memory_map)
             R_nl = ray.put(self.R_nl)
             random.shuffle(_jobs_for_M)
-            obj_ids = [self._calculate_Z_CPU_multi.remote(job, _vol, self.dim,
+            if self.args.bit8:
+                C = ComplexArray()
+                obj_ids = [self._calculate_Z_CPU_multi.remote(job, _vol, self.dim,
                                                               Y_lm_memory_map, self.Y_lm_zarr, Y_lm,
-                                                              R_nl_memory_map, self.R_nl_zarr, R_nl) for job in _jobs_for_M]
+                                                              R_nl_memory_map, self.R_nl_zarr, R_nl, C, bit8=True) for job in _jobs_for_M]
+            else:
+                obj_ids = [self._calculate_Z_CPU_multi.remote(job, _vol, self.dim,
+                                                              Y_lm_memory_map, self.Y_lm_zarr, Y_lm,
+                                                              R_nl_memory_map, self.R_nl_zarr, R_nl, None, bit8=False) for job in _jobs_for_M]
             for x in tqdm(self.to_iterator(obj_ids), total=len(obj_ids)):
                 if len(x) > 1:
                     for out in x:
@@ -2556,27 +2654,9 @@ class ZernikeSpherical:
                     n, l, m, mom = x[0]
                     self.moments.set_moment(n, l, m, mom)
 
-        elif self.mode == '1m':
-            if self.args.verbose:
-                print(f"Calculating the Zernike moments, Z_nlm")
-            _vol = ray.put(volume)
-            Y_lm_memory_map = ray.put(self.Y_lm_memory_map)
-            Y_lm = ray.put(self.Y_lm)
-            R_nl_memory_map = ray.put(self.R_nl_memory_map)
-            R_nl = ray.put(self.R_nl)
-            random.shuffle(_jobs_for_M)
-            obj_ids = [self._calculate_Z_CPU_multi.remote(job, _vol, self.dim,
-                                                          Y_lm_memory_map, self.Y_lm_zarr, Y_lm,
-                                                          R_nl_memory_map, self.R_nl_zarr, R_nl) for job in _jobs_for_M]
-            for x in tqdm(self.to_iterator(obj_ids), total=len(obj_ids)):
-                if len(x) > 1:
-                    for out in x:
-                        n, l, m, mom = out
-                        self.moments.set_moment(n, l, m, mom)
-                else:
-                    n, l, m, mom = x[0]
-                    self.moments.set_moment(n, l, m, mom)
-
+        # COMPUTE MODE 0
+        # || CPU ONLY || In case of low system RAM and no GPU...
+        # Ylm, Rnl, Z cumulative sum all CPU dependent, files on disk for low memory (very slow)
         elif self.mode == '0':
             if self.args.verbose:
                 print(f"Calculating the Zernike moments, Z_nlm")
@@ -2851,6 +2931,9 @@ class ZernikeSpherical:
 
     def run(self, decompose=False, reconstruct=False, flip=False):
         #Initiate decompose or reconstruct
+        # Record start time
+        start_time = time.time()
+
         volume = []
         if decompose:
             # Single volume or multiple volumes (in or out)
@@ -2897,6 +2980,13 @@ class ZernikeSpherical:
                     self.moments.add_dimension()
                 self.moments.set_latents(particles=particles, components=len(volume)-1)
                 self.moments.save(output=self.args.output, compress=self.args.save_bit8, dim=self.dim, apix=self.apix)
+
+            # Record end time
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+
+            # Report total execution time
+            print(f"AUTO: Total execution time: {elapsed_time:.2f} seconds")
 
         if reconstruct:
             # Single volume or multiple volumes (in or out)
@@ -3221,5 +3311,4 @@ if __name__ == "__main__":
             Z = ZernikeSpherical(args)
         else:
             Z = ZernikeMonomial(args)
-
         Z.run(reconstruct=True)
